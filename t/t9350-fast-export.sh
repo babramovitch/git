@@ -630,4 +630,40 @@ test_expect_success 'merge commit gets exported with --import-marks' '
 	)
 '
 
+test_expect_success 'rename detection and --always-show-modify-after-rename' '
+	test_create_repo renames &&
+	(
+		cd renames &&
+		test_seq 0  9  >single_digit &&
+		test_seq 10 98 >double_digit &&
+		git add . &&
+		git commit -m initial &&
+
+		echo 99 >>double_digit &&
+		git mv single_digit single-digit &&
+		git mv double_digit double-digit &&
+		git add double-digit &&
+		git commit -m renames &&
+
+		# First, check normal fast-export -M output
+		git fast-export -M --no-data master >out &&
+
+		grep double-digit out >out2 &&
+		test_line_count = 2 out2 &&
+
+		grep single-digit out >out2 &&
+		test_line_count = 1 out2 &&
+
+		# Now, test with --always-show-modify-after-rename; should
+		# have an extra "M" directive for "single-digit".
+		git fast-export -M --no-data --always-show-modify-after-rename master >out &&
+
+		grep double-digit out >out2 &&
+		test_line_count = 2 out2 &&
+
+		grep single-digit out >out2 &&
+		test_line_count = 2 out2
+	)
+'
+
 test_done

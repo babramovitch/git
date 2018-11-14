@@ -38,6 +38,7 @@ static int use_done_feature;
 static int no_data;
 static int full_tree;
 static int reference_excluded_commits;
+static int always_show_modify_after_rename;
 static int show_original_ids;
 static struct string_list extra_refs = STRING_LIST_INIT_NODUP;
 static struct string_list tag_refs = STRING_LIST_INIT_NODUP;
@@ -407,7 +408,8 @@ static void show_filemodify(struct diff_queue_struct *q,
 				putchar('\n');
 
 				if (oideq(&ospec->oid, &spec->oid) &&
-				    ospec->mode == spec->mode)
+				    ospec->mode == spec->mode &&
+				    !always_show_modify_after_rename)
 					break;
 			}
 			/* fallthrough */
@@ -1105,6 +1107,9 @@ int cmd_fast_export(int argc, const char **argv, const char *prefix)
 			 &reference_excluded_commits, N_("Reference parents which are not in fast-export stream by sha1sum")),
 		OPT_BOOL(0, "show-original-ids", &show_original_ids,
 			    N_("Show original sha1sums of blobs/commits")),
+		OPT_BOOL(0, "always-show-modify-after-rename",
+			    &always_show_modify_after_rename,
+			 N_("Always provide 'M' directive after 'R'")),
 
 		OPT_END()
 	};

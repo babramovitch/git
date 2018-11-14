@@ -129,6 +129,17 @@ marks the same across runs.
 	for intermediary filters (e.g. for rewriting commit messages
 	which refer to older commits, or for stripping blobs by id).
 
+--always-show-modify-after-rename::
+	When a rename is detected, fast-export normally issues both a
+	'R' (rename) and a 'M' (modify) directive.  However, if the
+	contents of the old and new filename match exactly, it will
+	only issue the rename directive.  Use this flag to have it
+	always issue the modify directive after the rename, which may
+	be useful for tools which are using the fast-export stream as
+	a mechanism for gathering statistics about a repository.  Note
+	that this option only has effect when rename detection is
+	active (see the -M option).
+
 --refspec::
 	Apply the specified refspec to each ref exported. Multiple of them can
 	be specified.
