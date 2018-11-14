@@ -900,7 +900,18 @@ static void handle_tags_and_duplicates(void)
 			if (anonymize)
 				name = anonymize_refname(name);
 			/* create refs pointing to already seen commits */
-			commit = (struct commit *)object;
+			commit = rewrite_commit((struct commit *)object);
+			if (!commit) {
+				/*
+				 * Neither this object nor any of its
+				 * ancestors touch any relevant paths, so
+				 * it has been filtered to nothing.  Delete
+				 * it.
+				 */
+				printf("reset %s\nfrom %s\n\n",
+				       name, sha1_to_hex(null_sha1));
+				continue;
+			}
 			printf("reset %s\nfrom :%d\n\n", name,
 			       get_object_mark(&commit->object));
 			show_progress();
