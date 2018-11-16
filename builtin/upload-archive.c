@@ -85,6 +85,8 @@ int cmd_upload_archive(int argc, const char **argv, const char *prefix)
 	if (argc == 2 && !strcmp(argv[1], "-h"))
 		usage(upload_archive_usage);
 
+	register_allowed_protocol_version(protocol_v0);
+
 	if (version == protocol_v2) {
 		struct serve_options options = SERVE_OPTIONS_INIT;
 
