@@ -966,7 +966,7 @@ static void handle_tags_and_duplicates(struct string_list *extras)
 				}
 				/* set ref to commit using oid, not mark */
 				printf("reset %s\nfrom %s\n\n", name,
-				       sha1_to_hex(commit->object.oid.hash));
+				       oid_to_hex(&commit->object.oid));
 				continue;
 			}
 
