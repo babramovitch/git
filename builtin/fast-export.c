@@ -31,13 +31,17 @@ static const char *fast_export_usage[] = {
 };
 
 static int progress;
-static enum { ABORT, VERBATIM, WARN, WARN_STRIP, STRIP } signed_tag_mode = ABORT;
-static enum { ERROR, DROP, REWRITE } tag_of_filtered_mode = ERROR;
+static enum { SIGNED_TAG_ABORT, VERBATIM, WARN, WARN_STRIP, STRIP } signed_tag_mode = SIGNED_TAG_ABORT;
+static enum { TAG_FILTERING_ABORT, DROP, REWRITE } tag_of_filtered_mode = TAG_FILTERING_ABORT;
 static int fake_missing_tagger;
 static int use_done_feature;
 static int no_data;
 static int full_tree;
+static int reference_excluded_commits;
+static int always_show_modify_after_rename;
+static int show_original_ids;
 static struct string_list extra_refs = STRING_LIST_INIT_NODUP;
+static struct string_list tag_refs = STRING_LIST_INIT_NODUP;
 static struct refspec refspecs = REFSPEC_INIT_FETCH;
 static int anonymize;
 static struct revision_sources revision_sources;
@@ -46,7 +50,7 @@ static int parse_opt_signed_tag_mode(const struct option *opt,
 				     const char *arg, int unset)
 {
 	if (unset || !strcmp(arg, "abort"))
-		signed_tag_mode = ABORT;
+		signed_tag_mode = SIGNED_TAG_ABORT;
 	else if (!strcmp(arg, "verbatim") || !strcmp(arg, "ignore"))
 		signed_tag_mode = VERBATIM;
 	else if (!strcmp(arg, "warn"))
@@ -64,7 +68,7 @@ static int parse_opt_tag_of_filtered_mode(const struct option *opt,
 					  const char *arg, int unset)
 {
 	if (unset || !strcmp(arg, "abort"))
-		tag_of_filtered_mode = ERROR;
+		tag_of_filtered_mode = TAG_FILTERING_ABORT;
 	else if (!strcmp(arg, "drop"))
 		tag_of_filtered_mode = DROP;
 	else if (!strcmp(arg, "rewrite"))
@@ -187,6 +191,22 @@ static int get_object_mark(struct object *object)
 	return ptr_to_mark(decoration);
 }
 
+static struct commit *rewrite_commit(struct commit *p)
+{
+	for (;;) {
+		if (p->parents && p->parents->next)
+			break;
+		if (p->object.flags & UNINTERESTING)
+			break;
+		if (!(p->object.flags & TREESAME))
+			break;
+		if (!p->parents)
+			return NULL;
+		p = p->parents->item;
+	}
+	return p;
+}
+
 static void show_progress(void)
 {
 	static int counter = 0;
@@ -253,7 +273,10 @@ static void export_blob(const struct object_id *oid)
 
 	mark_next_object(object);
 
-	printf("blob\nmark :%"PRIu32"\ndata %"PRIuMAX"\n", last_idnum, (uintmax_t)size);
+	printf("blob\nmark :%"PRIu32"\n", last_idnum);
+	if (show_original_ids)
+		printf("original-oid %s\n", oid_to_hex(oid));
+	printf("data %"PRIuMAX"\n", (uintmax_t)size);
 	if (size && fwrite(buf, size, 1, stdout) != 1)
 		die_errno("could not write blob '%s'", oid_to_hex(oid));
 	printf("\n");
@@ -385,7 +408,8 @@ static void show_filemodify(struct diff_queue_struct *q,
 				putchar('\n');
 
 				if (oideq(&ospec->oid, &spec->oid) &&
-				    ospec->mode == spec->mode)
+				    ospec->mode == spec->mode &&
+				    !always_show_modify_after_rename)
 					break;
 			}
 			/* fallthrough */
@@ -579,7 +603,8 @@ static void handle_commit(struct commit *commit, struct rev_info *rev,
 		message += 2;
 
 	if (commit->parents &&
-	    get_object_mark(&commit->parents->item->object) != 0 &&
+	    (get_object_mark(&commit->parents->item->object) != 0 ||
+	     reference_excluded_commits) &&
 	    !full_tree) {
 		parse_commit_or_die(commit->parents->item);
 		diff_tree_oid(get_commit_tree_oid(commit->parents->item),
@@ -595,6 +620,13 @@ static void handle_commit(struct commit *commit, struct rev_info *rev,
 			export_blob(&diff_queued_diff.queue[i]->two->oid);
 
 	refname = *revision_sources_at(&revision_sources, commit);
+	/*
+	 * FIXME: string_list_remove() below for each ref is overall
+	 * O(N^2).  Compared to a history walk and diffing trees, this is
+	 * just lost in the noise in practice.  However, theoretically a
+	 * repo may have enough refs for this to become slow.
+	 */
+	string_list_remove(&extra_refs, refname, 0);
 	if (anonymize) {
 		refname = anonymize_refname(refname);
 		anonymize_ident_line(&committer, &committer_end);
@@ -608,8 +640,10 @@ static void handle_commit(struct commit *commit, struct rev_info *rev,
 		reencoded = reencode_string(message, "UTF-8", encoding);
 	if (!commit->parents)
 		printf("reset %s\n", refname);
-	printf("commit %s\nmark :%"PRIu32"\n%.*s\n%.*s\ndata %u\n%s",
-	       refname, last_idnum,
+	printf("commit %s\nmark :%"PRIu32"\n", refname, last_idnum);
+	if (show_original_ids)
+		printf("original-oid %s\n", oid_to_hex(&commit->object.oid));
+	printf("%.*s\n%.*s\ndata %u\n%s",
 	       (int)(author_end - author), author,
 	       (int)(committer_end - committer), committer,
 	       (unsigned)(reencoded
@@ -620,13 +654,21 @@ static void handle_commit(struct commit *commit, struct rev_info *rev,
 	unuse_commit_buffer(commit, commit_buffer);
 
 	for (i = 0, p = commit->parents; p; p = p->next) {
-		int mark = get_object_mark(&p->item->object);
-		if (!mark)
+		struct object *obj = &p->item->object;
+		int mark = get_object_mark(obj);
+
+		if (!mark && !reference_excluded_commits)
 			continue;
 		if (i == 0)
-			printf("from :%d\n", mark);
+			printf("from ");
 		else
-			printf("merge :%d\n", mark);
+			printf("merge ");
+		if (mark)
+			printf(":%d\n", mark);
+		else
+			printf("%s\n", sha1_to_hex(anonymize ?
+						   anonymize_sha1(&obj->oid) :
+						   obj->oid.hash));
 		i++;
 	}
 
@@ -727,7 +769,7 @@ static void handle_tag(const char *name, struct tag *tag)
 					       "\n-----BEGIN PGP SIGNATURE-----\n");
 		if (signature)
 			switch(signed_tag_mode) {
-			case ABORT:
+			case SIGNED_TAG_ABORT:
 				die("encountered signed tag %s; use "
 				    "--signed-tags=<mode> to handle it",
 				    oid_to_hex(&tag->object.oid));
@@ -752,7 +794,7 @@ static void handle_tag(const char *name, struct tag *tag)
 	tagged_mark = get_object_mark(tagged);
 	if (!tagged_mark) {
 		switch(tag_of_filtered_mode) {
-		case ABORT:
+		case TAG_FILTERING_ABORT:
 			die("tag %s tags unexported object; use "
 			    "--tag-of-filtered-object=<mode> to handle it",
 			    oid_to_hex(&tag->object.oid));
@@ -766,18 +808,12 @@ static void handle_tag(const char *name, struct tag *tag)
 				    oid_to_hex(&tag->object.oid),
 				    type_name(tagged->type));
 			}
-			p = (struct commit *)tagged;
-			for (;;) {
-				if (p->parents && p->parents->next)
-					break;
-				if (p->object.flags & UNINTERESTING)
-					break;
-				if (!(p->object.flags & TREESAME))
-					break;
-				if (!p->parents)
-					die("can't find replacement commit for tag %s",
-					     oid_to_hex(&tag->object.oid));
-				p = p->parents->item;
+			p = rewrite_commit((struct commit *)tagged);
+			if (!p) {
+				printf("reset %s\nfrom %s\n\n",
+				       name, sha1_to_hex(null_sha1));
+				free(buf);
+				return;
 			}
 			tagged_mark = get_object_mark(&p->object);
 		}
@@ -785,8 +821,10 @@ static void handle_tag(const char *name, struct tag *tag)
 
 	if (starts_with(name, "refs/tags/"))
 		name += 10;
-	printf("tag %s\nfrom :%d\n%.*s%sdata %d\n%.*s\n",
-	       name, tagged_mark,
+	printf("tag %s\nfrom :%d\n", name, tagged_mark);
+	if (show_original_ids)
+		printf("original-oid %s\n", oid_to_hex(&tag->object.oid));
+	printf("%.*s%sdata %d\n%.*s\n",
 	       (int)(tagger_end - tagger), tagger,
 	       tagger == tagger_end ? "" : "\n",
 	       (int)message_size, (int)message_size, message ? message : "");
@@ -804,7 +842,7 @@ static struct commit *get_commit(struct rev_cmdline_entry *e, char *full_name)
 		/* handle nested tags */
 		while (tag && tag->object.type == OBJ_TAG) {
 			parse_object(the_repository, &tag->object.oid);
-			string_list_append(&extra_refs, full_name)->util = tag;
+			string_list_append(&tag_refs, full_name)->util = tag;
 			tag = (struct tag *)tag->tagged;
 		}
 		if (!tag)
@@ -863,25 +901,30 @@ static void get_tags_and_duplicates(struct rev_cmdline_info *info)
 		}
 
 		/*
-		 * This ref will not be updated through a commit, lets make
-		 * sure it gets properly updated eventually.
+		 * Make sure this ref gets properly updated eventually, whether
+		 * through a commit or manually at the end.
 		 */
-		if (*revision_sources_at(&revision_sources, commit) ||
-		    commit->object.flags & SHOWN)
+		if (e->item->type != OBJ_TAG)
 			string_list_append(&extra_refs, full_name)->util = commit;
+
 		if (!*revision_sources_at(&revision_sources, commit))
 			*revision_sources_at(&revision_sources, commit) = full_name;
 	}
+
+	string_list_sort(&extra_refs);
+	string_list_remove_duplicates(&extra_refs, 0);
 }
 
-static void handle_tags_and_duplicates(void)
+static void handle_tags_and_duplicates(struct string_list *extras)
 {
 	struct commit *commit;
 	int i;
 
-	for (i = extra_refs.nr - 1; i >= 0; i--) {
-		const char *name = extra_refs.items[i].string;
-		struct object *object = extra_refs.items[i].util;
+	for (i = extras->nr - 1; i >= 0; i--) {
+		const char *name = extras->items[i].string;
+		struct object *object = extras->items[i].util;
+		int mark;
+
 		switch (object->type) {
 		case OBJ_TAG:
 			handle_tag(name, (struct tag *)object);
@@ -890,9 +933,45 @@ static void handle_tags_and_duplicates(void)
 			if (anonymize)
 				name = anonymize_refname(name);
 			/* create refs pointing to already seen commits */
-			commit = (struct commit *)object;
-			printf("reset %s\nfrom :%d\n\n", name,
-			       get_object_mark(&commit->object));
+			commit = rewrite_commit((struct commit *)object);
+			if (!commit) {
+				/*
+				 * Neither this object nor any of its
+				 * ancestors touch any relevant paths, so
+				 * it has been filtered to nothing.  Delete
+				 * it.
+				 */
+				printf("reset %s\nfrom %s\n\n",
+				       name, sha1_to_hex(null_sha1));
+				continue;
+			}
+
+			mark = get_object_mark(&commit->object);
+			if (!mark) {
+				/*
+				 * Getting here means we have a commit which
+				 * was excluded by a negative refspec (e.g.
+				 * fast-export ^master master).  If we are
+				 * referencing excluded commits, set the ref
+				 * to the exact commit.  Otherwise, the user
+				 * wants the branch exported but every commit
+				 * in its history to be deleted, which basically
+				 * just means deletion of the ref.
+				 */
+				if (!reference_excluded_commits) {
+					/* delete the ref */
+					printf("reset %s\nfrom %s\n\n",
+					       name, sha1_to_hex(null_sha1));
+					continue;
+				}
+				/* set ref to commit using oid, not mark */
+				printf("reset %s\nfrom %s\n\n", name,
+				       sha1_to_hex(commit->object.oid.hash));
+				continue;
+			}
+
+			printf("reset %s\nfrom :%d\n\n", name, mark
+			       );
 			show_progress();
 			break;
 		}
@@ -1024,6 +1103,14 @@ int cmd_fast_export(int argc, const char **argv, const char *prefix)
 		OPT_STRING_LIST(0, "refspec", &refspecs_list, N_("refspec"),
 			     N_("Apply refspec to exported refs")),
 		OPT_BOOL(0, "anonymize", &anonymize, N_("anonymize output")),
+		OPT_BOOL(0, "reference-excluded-parents",
+			 &reference_excluded_commits, N_("Reference parents which are not in fast-export stream by sha1sum")),
+		OPT_BOOL(0, "show-original-ids", &show_original_ids,
+			    N_("Show original sha1sums of blobs/commits")),
+		OPT_BOOL(0, "always-show-modify-after-rename",
+			    &always_show_modify_after_rename,
+			 N_("Always provide 'M' directive after 'R'")),
+
 		OPT_END()
 	};
 
@@ -1080,7 +1167,8 @@ int cmd_fast_export(int argc, const char **argv, const char *prefix)
 		}
 	}
 
-	handle_tags_and_duplicates();
+	handle_tags_and_duplicates(&extra_refs);
+	handle_tags_and_duplicates(&tag_refs);
 	handle_deletes();
 
 	if (export_filename && lastimportid != last_idnum)
